@@ -1,0 +1,81 @@
+# plugin-builder-workflow v1 (installed and updated automatically by the Plugin Builder app)
+name: Plugin Build
+run-name: build ${{ inputs.job }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      job:
+        description: Job id
+        required: true
+      java:
+        description: Java version
+        required: false
+        default: '21'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Unpack project
+        run: |
+          mkdir -p work
+          unzip -q "builds/${{ inputs.job }}.zip" -d work
+          cd work
+          P="$PWD"
+          if [ ! -f pom.xml ] && [ ! -f build.gradle ] && [ ! -f build.gradle.kts ]; then
+            F=$(find . -maxdepth 3 \( -name pom.xml -o -name build.gradle -o -name build.gradle.kts \) | head -n 1)
+            if [ -n "$F" ]; then P="$PWD/$(dirname "$F")"; fi
+          fi
+          echo "PROJECT=$P" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.java }}
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.10'
+
+      - name: Build
+        run: |
+          cd "$PROJECT"
+          if [ -f pom.xml ]; then
+            mvn -B -ntp package -DskipTests
+          else
+            if [ -f gradlew ]; then chmod +x gradlew; G=./gradlew; else G=gradle; fi
+            $G build -x test --no-daemon
+            $G shadowJar -x test --no-daemon || true
+          fi
+
+      - name: Collect JARs
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          cd "$PROJECT"
+          find . -type f -name '*.jar' \( -path '*/target/*' -o -path '*/build/libs/*' \) \
+            ! -name 'original-*' ! -name '*-sources.jar' ! -name '*-javadoc.jar' ! -name '*-plain.jar' \
+            -exec cp -n {} "$GITHUB_WORKSPACE/out/" \;
+          ls -la "$GITHUB_WORKSPACE/out"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: plugin-${{ inputs.job }}
+          path: out/*.jar
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Remove the uploaded source from the repo
+        if: always()
+        run: |
+          git config user.name "plugin-builder"
+          git config user.email "plugin-builder@users.noreply.github.com"
+          git pull -q --rebase || true
+          git rm -q --ignore-unmatch "builds/${{ inputs.job }}.zip"
+          git commit -q -m "Remove upload ${{ inputs.job }}" || true
+          git push -q || true

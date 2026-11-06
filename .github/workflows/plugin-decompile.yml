@@ -1,0 +1,88 @@
+# plugin-builder-decompile v1 (installed and updated automatically by the Plugin Builder app)
+name: Plugin Decompile
+run-name: decompile ${{ inputs.job }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      job:
+        description: Job id
+        required: true
+      jarfilter:
+        description: Regex of classes to decompile (empty = all)
+        required: false
+        default: ''
+      deps:
+        description: Comma separated group:artifact:version used as type information
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  decompile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Unpack the uploaded JAR
+        run: |
+          mkdir -p work
+          unzip -q "builds/${{ inputs.job }}.zip" -d work
+          test -f work/input.jar
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Download the CFR decompiler
+        run: curl -fsSL -o cfr.jar https://github.com/leibnitz27/cfr/releases/download/0.152/cfr-0.152.jar
+
+      - name: Fetch Paper API and libraries for type information
+        continue-on-error: true
+        env:
+          DEPS: ${{ inputs.deps }}
+        run: |
+          mkdir -p cp && cd cp
+          {
+            echo '<project xmlns="http://maven.apache.org/POM/4.0.0"><modelVersion>4.0.0</modelVersion><groupId>x</groupId><artifactId>x</artifactId><version>1</version>'
+            echo '<repositories><repository><id>paper</id><url>https://repo.papermc.io/repository/maven-public/</url></repository></repositories><dependencies>'
+            IFS=',' read -ra D <<< "$DEPS"
+            for d in "${D[@]}"; do
+              IFS=':' read -r g a v <<< "$d"
+              if [ -n "$a" ]; then echo "<dependency><groupId>$g</groupId><artifactId>$a</artifactId><version>$v</version></dependency>"; fi
+            done
+            echo '</dependencies></project>'
+          } > pom.xml
+          mvn -B -q -ntp dependency:copy-dependencies -DoutputDirectory=libs -DincludeScope=compile
+
+      - name: Decompile
+        env:
+          FILTER: ${{ inputs.jarfilter }}
+        run: |
+          CP=$(ls cp/libs/*.jar 2>/dev/null | tr '\n' ':')
+          CP=${CP%:}
+          ARGS=(work/input.jar --outputdir out --showversion false --silent true --recovertypeclash true --recovertypehints true --renameillegalidents true)
+          if [ -n "$CP" ]; then ARGS+=(--extraclasspath "$CP"); fi
+          if [ -n "$FILTER" ]; then ARGS+=(--jarfilter "$FILTER"); fi
+          java -Xmx4g -jar cfr.jar "${ARGS[@]}"
+          find out -name '*.java' | wc -l
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: decompiled-${{ inputs.job }}
+          path: out
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Remove the uploaded JAR from the repo
+        if: always()
+        run: |
+          git config user.name "plugin-builder"
+          git config user.email "plugin-builder@users.noreply.github.com"
+          git pull -q --rebase || true
+          git rm -q --ignore-unmatch "builds/${{ inputs.job }}.zip"
+          git commit -q -m "Remove upload ${{ inputs.job }}" || true
+          git push -q || true
